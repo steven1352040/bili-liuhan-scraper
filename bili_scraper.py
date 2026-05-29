@@ -1,17 +1,12 @@
 """
 B站 UP主「沙雕Mars」《关于我转生变成流汗黄豆》系列视频采集 & 分析脚本
 
-数据源：UP主的B站合集频道 (channel_id=28754)，55集一次性拉取
-功能：
-  1. 从合集频道获取全部 55 集视频
-  2. 自动分季/分篇章
-  3. 每集获取详情、弹幕、弹幕密度统计、热门评论
-  4. 输出 JSON + Markdown 大纲
-  5. --analyze 分析已采集数据
+按 B站合集原始分类，每个合集频道作为一季/系列。
+数据源：UP主空间的全部合集频道
 
 使用：
-  pip install bilibili-api-python python-dotenv yt-dlp
-  python bili_scraper.py              # 采集元数据 + 弹幕 + 评论
+  python bili_scraper.py              # 采集全部合集元数据（快速）
+  python bili_scraper.py --full       # 采集元数据 + 弹幕 + 评论（慢）
   python bili_scraper.py --analyze    # 分析已采集数据
 """
 
@@ -24,6 +19,8 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
+sys.stdout.reconfigure(encoding='utf-8')
+
 from bilibili_api import sync, user, video, comment
 from bilibili_api.comment import CommentResourceType
 
@@ -32,47 +29,24 @@ from bilibili_api.comment import CommentResourceType
 # ---------------------------------------------------------------------------
 
 UP_MID = 43739579
-CHANNEL_ID = 28754                     # 《流汗黄豆》合集频道的 ID
+UP_NAME = "沙雕Mars"
 OUTPUT_DIR = Path("output")
 OUTPUT_JSON = OUTPUT_DIR / "liuhan_data.json"
 OUTPUT_MD = OUTPUT_DIR / "liuhan_outline.md"
 
-# 第二季及以后的标题关键词（其余自动归为第一季）
-SEASON_RULES = [
-    ("大专|生化|丧尸|厂长|雌小豆|西瓜条|求生之路", "第二季"),
-    ("狼人杀", "第三季·狼人杀篇"),
-    ("马之勇者|钢琴家", "外传·马之勇者"),
-]
-
-# 第一季篇章规则（按在视频列表中的序号区间划分）
-ARC_RULES = [
-    (range(1, 3),   "启程篇"),
-    (range(3, 9),   "芜湖港篇"),
-    (range(9, 17),  "歪比巴卜篇"),
-    (range(17, 20), "捉鬼篇"),
-    (range(20, 28), "偶像篇"),
+# 要采集的合集频道 ID 及其自定义名称 & 排序
+# B站上该UP主的合集已按季/系列分好
+CHANNELS = [
+    {"id": 28754,   "name": "第一季·原创动画",      "order": 1},
+    {"id": 2199285, "name": "第一季·合集版",         "order": 2},
+    {"id": 5096626, "name": "番外·表情包大战PVZ",    "order": 3},
+    {"id": 5134293, "name": "番外·emoji日常",        "order": 4},
 ]
 
 
 # ---------------------------------------------------------------------------
 # 工具
 # ---------------------------------------------------------------------------
-
-def classify_season(title: str) -> str:
-    for keyword, season_name in SEASON_RULES:
-        if re.search(keyword, title):
-            return season_name
-    return "第一季"
-
-
-def classify_arc(index: int, season: str) -> str:
-    if season != "第一季":
-        return ""
-    for rng, arc_name in ARC_RULES:
-        if index in rng:
-            return arc_name
-    return ""
-
 
 def ts_to_str(ts: int) -> str:
     if not ts:
@@ -85,26 +59,46 @@ def safe_filename(name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 数据采集
+# 数据采集（元数据）
 # ---------------------------------------------------------------------------
 
-def fetch_channel_videos(channel_id: int = CHANNEL_ID) -> list:
-    """从合集频道获取全部视频"""
+def fetch_all_channels() -> list[dict]:
+    """获取所有目标合集的视频列表，返回 [{channel_info, videos}, ...]"""
     u = user.User(UP_MID)
     channels = sync(u.get_channels())
 
-    for ch in channels:
-        meta = sync(ch.get_meta())
-        if ch.id_ == channel_id:
-            print(f"  合集频道：{meta.get('name', '?')}（{meta.get('total', 0)} 集）")
-            resp = sync(ch.get_videos(ps=100))
-            archives = resp.get("archives", [])
-            print(f"  获取到 {len(archives)} 个视频")
-            return archives
+    results = []
+    for ch_config in CHANNELS:
+        target_id = ch_config["id"]
+        found = False
+        for ch in channels:
+            meta = sync(ch.get_meta())
+            if ch.id_ == target_id:
+                resp = sync(ch.get_videos(ps=100))
+                archives = resp.get("archives", [])
+                results.append({
+                    "channel_id": target_id,
+                    "channel_name": ch_config["name"],
+                    "order": ch_config["order"],
+                    "bilibili_name": meta.get("name", ""),
+                    "bilibili_total": meta.get("total", 0),
+                    "description": meta.get("description", ""),
+                    "videos": archives,
+                    "fetched": len(archives),
+                })
+                print(f"  [{ch_config['name']}] {meta.get('name', '?')} "
+                      f"— {len(archives)}/{meta.get('total', 0)} 集")
+                found = True
+                break
+        if not found:
+            print(f"  [WARN] 未找到合集频道 id={target_id} ({ch_config['name']})")
 
-    print("  [ERROR] 未找到目标合集频道")
-    return []
+    return results
 
+
+# ---------------------------------------------------------------------------
+# 数据采集（详情/弹幕/评论）
+# ---------------------------------------------------------------------------
 
 def fetch_video_detail(bvid: str) -> dict | None:
     v = video.Video(bvid=bvid)
@@ -116,7 +110,6 @@ def fetch_video_detail(bvid: str) -> dict | None:
 
 
 def fetch_danmaku(bvid: str, cid: int, max_dms: int = 3000) -> list:
-    """返回 [(时间秒, 文本), ...]"""
     v = video.Video(bvid=bvid)
     dms = []
     try:
@@ -141,17 +134,13 @@ def fetch_danmaku(bvid: str, cid: int, max_dms: int = 3000) -> list:
 def fetch_comments(oid: int) -> list:
     try:
         resp = sync(comment.get_comments(
-            oid=oid,
-            type_=CommentResourceType.VIDEO,
-            page_index=1,
+            oid=oid, type_=CommentResourceType.VIDEO, page_index=1,
         ))
         replies = resp.get("replies") or []
         return [
-            {
-                "user": r.get("member", {}).get("uname", ""),
-                "content": r.get("content", {}).get("message", ""),
-                "likes": r.get("like", 0),
-            }
+            {"user": r.get("member", {}).get("uname", ""),
+             "content": r.get("content", {}).get("message", ""),
+             "likes": r.get("like", 0)}
             for r in replies[:20]
         ]
     except Exception as e:
@@ -163,80 +152,72 @@ def fetch_comments(oid: int) -> list:
 # 数据整理
 # ---------------------------------------------------------------------------
 
-def organize_series(archives: list) -> dict:
-    """按发布时间排序 + 按季度/篇章分组"""
-    archives.sort(key=lambda v: v.get("pubdate", 0) or v.get("ctime", 0))
-
+def organize(channel_results: list[dict]) -> dict:
+    """将频道数据整理为统一的 seasons 结构"""
     seasons = {}
-    second_season_idx = 0   # 第二季之后的集数，用于独立编号
+    total_eps = 0
 
-    for idx, v in enumerate(archives):
-        title = v.get("title", "")
-        season = classify_season(title)
-        arc = classify_arc(idx, season)
+    for ch in sorted(channel_results, key=lambda x: x["order"]):
+        season_name = ch["channel_name"]
+        episodes = []
 
-        if season not in seasons:
-            seasons[season] = []
+        for idx, v in enumerate(ch["videos"]):
+            title = v.get("title", "")
+            stat = v.get("stat", {}) if isinstance(v.get("stat"), dict) else {}
+            episodes.append({
+                "index": idx + 1,
+                "title": title,
+                "bvid": v.get("bvid", ""),
+                "aid": v.get("aid", 0),
+                "cid": v.get("cid", 0),
+                "created": ts_to_str(v.get("pubdate", 0) or v.get("ctime", 0)),
+                "duration": v.get("duration", ""),
+                "play": stat.get("view", v.get("play", 0)),
+                "danmaku_count": stat.get("danmaku", 0),
+                "description": v.get("desc", ""),
+            })
 
-        if season == "第一季":
-            ep_num = idx + 1
-        else:
-            second_season_idx += 1
-            ep_num = second_season_idx
+        seasons[season_name] = {
+            "channel_id": ch["channel_id"],
+            "bilibili_name": ch["bilibili_name"],
+            "description": ch["description"],
+            "episodes": episodes,
+        }
+        total_eps += len(episodes)
 
-        seasons[season].append({
-            "index": ep_num,
-            "title": title,
-            "bvid": v.get("bvid", ""),
-            "aid": v.get("aid", 0),
-            "cid": v.get("cid", 0),
-            "created": ts_to_str(v.get("pubdate", 0) or v.get("ctime", 0)),
-            "duration": v.get("duration", ""),
-            "play": v.get("stat", {}).get("view", 0) if isinstance(v.get("stat"), dict) else v.get("play", 0),
-            "danmaku_count": v.get("stat", {}).get("danmaku", 0) if isinstance(v.get("stat"), dict) else 0,
-            "description": v.get("desc", ""),
-            "arc": arc,
-        })
-
-    return seasons
+    return {"seasons": seasons, "total_episodes": total_eps}
 
 
 # ---------------------------------------------------------------------------
 # 输出
 # ---------------------------------------------------------------------------
 
-def generate_markdown(seasons: dict) -> str:
+def generate_markdown(data: dict) -> str:
+    seasons = data["seasons"]
     lines = [
         "# 《关于我转生变成流汗黄豆这档事》采集结果",
         "",
         f"> 自动采集时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        f"> UP主 UID：{UP_MID} | 合集频道 ID：{CHANNEL_ID}",
+        f"> UP主：{UP_NAME}（UID: {UP_MID}）",
+        "",
+        f"**总计 {data['total_episodes']} 集** | 共 {len(seasons)} 个分类",
         "",
     ]
 
-    total_eps = 0
-    season_order = ["第一季", "第二季", "第三季·狼人杀篇", "外传·马之勇者"]
-
-    for season_name in season_order:
-        episodes = seasons.get(season_name, [])
-        if not episodes:
-            continue
-        total_eps += len(episodes)
+    for season_name, info in seasons.items():
+        episodes = info["episodes"]
         lines.append(f"## {season_name}（{len(episodes)} 集）")
+        lines.append(f"> B站合集：{info['bilibili_name']}")
+        if info["description"]:
+            lines.append(f"> {info['description'][:200]}")
         lines.append("")
 
-        current_arc = ""
         for ep in episodes:
-            if ep["arc"] and ep["arc"] != current_arc:
-                current_arc = ep["arc"]
-                lines.append(f"### {current_arc}")
-                lines.append("")
-
             lines.append(f"### 第 {ep['index']} 集 · {ep['title']}")
             lines.append("")
             lines.append(f"- **BV号**：`{ep['bvid']}`")
             lines.append(f"- **发布时间**：{ep['created']}")
-            lines.append(f"- **时长**：{ep['duration']}")
+            lines.append(f"- **时长**：{ep['duration']}秒")
             lines.append(f"- **播放量**：{ep.get('play', 0):,}")
             lines.append(f"- **弹幕数**：{ep.get('danmaku_count', 0):,}")
             lines.append(f"- **点赞**：{ep.get('like', 0):,}")
@@ -250,7 +231,7 @@ def generate_markdown(seasons: dict) -> str:
 
             if ep.get("danmaku_highlights"):
                 lines.append("**弹幕高能时刻**：")
-                for ts, density in ep.get("danmaku_highlights", [])[:5]:
+                for ts, density in ep["danmaku_highlights"][:5]:
                     lines.append(f"  - `{ts}s` 弹幕密度 {density}")
                 lines.append("")
 
@@ -264,9 +245,6 @@ def generate_markdown(seasons: dict) -> str:
             lines.append("---")
             lines.append("")
 
-    lines.insert(2, f"**总计 {total_eps} 集** | 共 {len(seasons)} 个季度")
-    lines.insert(3, "")
-
     return "\n".join(lines)
 
 
@@ -274,118 +252,128 @@ def generate_markdown(seasons: dict) -> str:
 # 主流程
 # ---------------------------------------------------------------------------
 
-def run(download_videos: bool = False):
+def run(full: bool = False, download_videos: bool = False):
     OUTPUT_DIR.mkdir(exist_ok=True)
 
     print("=" * 60)
-    print(f"B站视频采集 — 《关于我转生变成流汗黄豆这档事》")
-    print(f"合集频道 ID={CHANNEL_ID}")
+    print(f"B站视频采集 — 沙雕Mars 全部合集")
+    print(f"共 {len(CHANNELS)} 个合集频道")
     print("=" * 60)
 
-    # Step 1: 从合集频道获取全部视频
-    print("\n[1/4] 从合集频道获取视频列表 ...")
-    archives = fetch_channel_videos(CHANNEL_ID)
-    if not archives:
-        print("  [ERROR] 未获取到视频，退出")
+    # Step 1: 获取全部合集频道
+    print("\n[1/2] 从合集频道获取视频列表 ...")
+    channel_results = fetch_all_channels()
+    if not channel_results:
+        print("  [ERROR] 未获取到任何视频，退出")
         return
 
-    # Step 2: 整理分季
-    print("\n[2/4] 按季度/篇章整理 ...")
-    seasons = organize_series(archives)
-    total_eps = sum(len(v) for v in seasons.values())
-    print(f"  共 {total_eps} 集，分布在 {len(seasons)} 个季度中")
-    for s_name, eps in seasons.items():
-        print(f"    {s_name}: {len(eps)} 集")
+    total_videos = sum(ch["fetched"] for ch in channel_results)
+    print(f"  共获取 {total_videos} 个视频")
 
-    # Step 3: 逐集获取详情/弹幕/评论
-    print("\n[3/4] 逐集获取详情、弹幕、评论 ...")
-    episode_count = 0
-    for season_name, episodes in seasons.items():
-        for ep in episodes:
-            episode_count += 1
-            bvid = ep["bvid"]
-            cid = ep.get("cid", 0)
-            title = ep["title"][:50]
-            print(f"  [{episode_count}/{total_eps}] [{season_name}] {title}")
+    # Step 1.5: 整理
+    data = organize(channel_results)
 
-            # 详情（补充缺失字段）
-            info = fetch_video_detail(bvid)
-            if info:
-                stat = info.get("stat", {})
-                ep["description"] = info.get("desc", ep.get("description", ""))
-                ep["play"] = stat.get("view", ep.get("play", 0))
-                ep["danmaku_count"] = stat.get("danmaku", ep.get("danmaku_count", 0))
-                ep["like"] = stat.get("like", 0)
-                ep["coin"] = stat.get("coin", 0)
-                ep["favorite"] = stat.get("favorite", 0)
-                ep["aid"] = info.get("aid", ep.get("aid", 0))
-                if not ep.get("cid"):
-                    ep["cid"] = info.get("cid", 0)
+    # Step 2 (可选): 逐集获取详情/弹幕/评论
+    if full:
+        print(f"\n[2/2] 逐集获取详情、弹幕、评论（共 {data['total_episodes']} 集）...")
+        episode_count = 0
+        for season_name, info in data["seasons"].items():
+            for ep in info["episodes"]:
+                episode_count += 1
+                bvid = ep["bvid"]
+                cid = ep.get("cid", 0)
+                title = ep["title"][:50]
+                print(f"  [{episode_count}/{data['total_episodes']}] "
+                      f"[{season_name}] {title}")
 
-            # 弹幕（需要有效的 cid）
-            if ep.get("cid"):
-                dms = fetch_danmaku(bvid, ep["cid"])
-                ep["danmaku_list"] = [{"time": t, "text": txt} for t, txt in dms[:200]]
+                info_resp = fetch_video_detail(bvid)
+                if info_resp:
+                    stat = info_resp.get("stat", {})
+                    ep["description"] = info_resp.get("desc", ep.get("description", ""))
+                    ep["play"] = stat.get("view", ep.get("play", 0))
+                    ep["danmaku_count"] = stat.get("danmaku", ep.get("danmaku_count", 0))
+                    ep["like"] = stat.get("like", 0)
+                    ep["coin"] = stat.get("coin", 0)
+                    ep["favorite"] = stat.get("favorite", 0)
+                    ep["aid"] = info_resp.get("aid", ep.get("aid", 0))
+                    if not ep.get("cid"):
+                        ep["cid"] = info_resp.get("cid", 0)
 
-                density = {}
-                for t, _ in dms:
-                    bucket = (t // 10) * 10
-                    density[bucket] = density.get(bucket, 0) + 1
-                ep["danmaku_highlights"] = sorted(density.items(), key=lambda x: -x[1])[:10]
-            else:
-                ep["danmaku_list"] = []
-                ep["danmaku_highlights"] = []
+                if ep.get("cid"):
+                    dms = fetch_danmaku(bvid, ep["cid"])
+                    ep["danmaku_list"] = [{"time": t, "text": txt} for t, txt in dms[:200]]
+                    density = {}
+                    for t, _ in dms:
+                        bucket = (t // 10) * 10
+                        density[bucket] = density.get(bucket, 0) + 1
+                    ep["danmaku_highlights"] = sorted(density.items(), key=lambda x: -x[1])[:10]
+                else:
+                    ep["danmaku_list"] = []
+                    ep["danmaku_highlights"] = []
 
-            # 评论
-            if ep.get("aid"):
-                ep["top_comments"] = fetch_comments(ep["aid"])
-            else:
-                ep["top_comments"] = []
+                if ep.get("aid"):
+                    ep["top_comments"] = fetch_comments(ep["aid"])
+                else:
+                    ep["top_comments"] = []
 
-            time.sleep(0.5)
+                time.sleep(0.3)
+    else:
+        print(f"\n[2/2] 跳过详情采集（使用 --full 可获取弹幕和评论）")
 
-    # Step 4: 输出
-    print("\n[4/4] 输出结果 ...")
+    # 输出
+    print("\n生成输出文件 ...")
 
     json_output = {
         "meta": {
             "up_mid": UP_MID,
-            "up_name": "沙雕Mars",
-            "channel_id": CHANNEL_ID,
-            "series": "关于我转生变成流汗黄豆这档事",
-            "total_episodes": total_eps,
-            "seasons": list(seasons.keys()),
+            "up_name": UP_NAME,
+            "total_episodes": data["total_episodes"],
+            "categories": list(data["seasons"].keys()),
             "generated_at": datetime.now().isoformat(),
         },
-        "seasons": seasons,
     }
+    # 扁平化 seasons 结构
+    json_seasons = {}
+    for name, info in data["seasons"].items():
+        json_seasons[name] = {
+            "channel_id": info["channel_id"],
+            "bilibili_name": info["bilibili_name"],
+            "episodes": info["episodes"],
+        }
+    json_output["seasons"] = json_seasons
 
     with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
         json.dump(json_output, f, ensure_ascii=False, indent=2)
     print(f"  JSON -> {OUTPUT_JSON}")
 
-    md = generate_markdown(seasons)
+    md = generate_markdown(data)
     with open(OUTPUT_MD, "w", encoding="utf-8") as f:
         f.write(md)
     print(f"  MD  -> {OUTPUT_MD}")
 
+    # 打印统计
+    print("\n" + "=" * 60)
+    print(f"采集完成！")
+    for s_name in data["seasons"]:
+        eps = data["seasons"][s_name]["episodes"]
+        total_play = sum(ep.get("play", 0) for ep in eps)
+        print(f"  {s_name}: {len(eps)} 集 | 总播放: {total_play:,}")
+    print(f"  **总计: {data['total_episodes']} 集**")
+    print("=" * 60)
+
     if download_videos:
         print("\n[可选] 用 yt-dlp 下载视频 ...")
-        _download_videos(seasons)
-
-    print("\n" + "=" * 60)
-    print("采集完成！")
-    print("=" * 60)
+        _download_videos(data["seasons"])
 
 
 def _download_videos(seasons: dict):
     dl_dir = OUTPUT_DIR / "videos"
     dl_dir.mkdir(exist_ok=True)
-    for episodes in seasons.values():
-        for ep in episodes:
+    for season_name, info in seasons.items():
+        for ep in info["episodes"]:
             url = f"https://www.bilibili.com/video/{ep['bvid']}"
-            name = safe_filename(f"{ep['title']}_{ep['bvid']}")
-            print(f"  下载: {name}")
+            name = safe_filename(f"[{season_name}]{ep['title']}_{ep['bvid']}")
+            print(f"  下载: {name[:60]}")
             try:
                 subprocess.run(
                     ["yt-dlp", "-o", str(dl_dir / f"{name}.%(ext)s"),
@@ -409,35 +397,38 @@ def analyze_series(json_path: str = str(OUTPUT_JSON)):
     print("数据分析")
     print("=" * 60)
 
-    all_dms = []
-    all_keywords = Counter()
+    for season_name, info in data["seasons"].items():
+        episodes = info["episodes"]
+        total_play = sum(ep.get("play", 0) for ep in episodes)
+        total_dm = sum(ep.get("danmaku_count", 0) for ep in episodes)
+        total_like = sum(ep.get("like", 0) for ep in episodes)
+        print(f"\n## {season_name}（{len(episodes)} 集）")
+        print(f"  总播放: {total_play:,} | 总弹幕: {total_dm:,} | 总点赞: {total_like:,}")
 
-    for season_name, episodes in data["seasons"].items():
-        print(f"\n## {season_name}")
-        for ep in episodes:
-            dms = ep.get("danmaku_list", [])
-            all_dms.extend(dms)
-            for word in ["抽象", "绝绝子", "偶像", "丧尸", "恶魔", "勇者",
-                         "狼人杀", "纯爱", "轮回"]:
-                if word in ep["title"]:
-                    all_keywords[word] += 1
+        # 播放量 TOP 5
+        sorted_eps = sorted(episodes, key=lambda e: e.get("play", 0), reverse=True)
+        print(f"  播放量 TOP 5:")
+        for ep in sorted_eps[:5]:
+            print(f"    {ep.get('play', 0):,} — {ep['title'][:50]}")
 
-            highlights = ep.get("danmaku_highlights", [])
-            top_info = f" 高能: {highlights[0][0]}s ({highlights[0][1]}条)" if highlights else ""
-            print(f"  {ep['title'][:50]}")
-            print(f"    播放: {ep.get('play', 0):,} | "
-                  f"弹幕: {ep.get('danmaku_count', 0):,} | "
-                  f"点赞: {ep.get('like', 0):,}{top_info}")
+        # 弹幕数 TOP 5
+        sorted_dm = sorted(episodes, key=lambda e: e.get("danmaku_count", 0), reverse=True)
+        print(f"  弹幕数 TOP 5:")
+        for ep in sorted_dm[:5]:
+            print(f"    {ep.get('danmaku_count', 0):,} — {ep['title'][:50]}")
 
-    print(f"\n## 总览")
-    print(f"  总弹幕数: {len(all_dms):,}")
-    print(f"  标题关键词: {all_keywords.most_common(10)}")
+    # 全系列总览
+    all_eps = []
+    for season_name, info in data["seasons"].items():
+        for ep in info["episodes"]:
+            ep = dict(ep)
+            ep["_season"] = season_name
+            all_eps.append(ep)
 
-    all_eps = [ep for episodes in data["seasons"].values() for ep in episodes]
     all_eps.sort(key=lambda e: e.get("play", 0), reverse=True)
-    print(f"\n## 播放量 TOP 10")
+    print(f"\n## 全系列播放量 TOP 10")
     for ep in all_eps[:10]:
-        print(f"  {ep['play']:,} — {ep['title']}")
+        print(f"  {ep.get('play', 0):,} [{ep['_season']}] {ep['title'][:50]}")
 
 
 # ---------------------------------------------------------------------------
@@ -448,6 +439,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="B站流汗黄豆系列采集器")
+    parser.add_argument("--full", action="store_true", help="获取全部详情（弹幕+评论，耗时较长）")
     parser.add_argument("--download", action="store_true", help="额外下载视频（需 yt-dlp）")
     parser.add_argument("--analyze", action="store_true", help="分析已采集的 JSON 数据")
     parser.add_argument("--json", default=str(OUTPUT_JSON), help="分析用的 JSON 路径")
@@ -456,4 +448,4 @@ if __name__ == "__main__":
     if args.analyze:
         analyze_series(args.json)
     else:
-        run(download_videos=args.download)
+        run(full=args.full, download_videos=args.download)
